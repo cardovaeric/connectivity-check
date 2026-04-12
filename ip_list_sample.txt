@@ -1,0 +1,7 @@
+# Solace Cloud Endpoints
+tke-jkt.messaging.solace.cloud:55555,55003,55443,5671,8883,8443,9443
+jkt.messaging.solace.cloud:55555,55003,55443,5671,8883,8443,9443
+
+#MFT
+10.54.96.8:2222
+
