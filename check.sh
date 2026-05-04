@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # ==============================================================================
-# Connectivity Test Strategy Script (Parallel + Auto-NOK Export)
+# Connectivity Test Strategy Script (Parallel + Grouped by Remark)
 # ==============================================================================
 
 # 1. Dependency Check
-for cmd in nc getent awk cut printf timeout sort wc grep; do
-    if ! command -v $cmd &> /dev/null; then
+for cmd in nc getent awk cut printf timeout sort wc grep sed xargs; do
+    if ! command -v $cmd > /dev/null; then
         echo "Error: Required command '$cmd' is not installed."
         exit 1
     fi
@@ -19,7 +19,7 @@ OUTPUT_NOK_FILE="nok_list.txt"
 SOURCE_IP=$(hostname -I | awk '{print $1}')
 
 TEMP_RESULTS=$(mktemp)
-NOK_TEMP=$(mktemp) # Temp file specifically for collecting NOK raw data
+NOK_TEMP=$(mktemp) 
 
 if [[ -z "$INPUT_FILE" || ! -f "$INPUT_FILE" ]]; then
     echo "Usage: $0 <filename>"
@@ -29,8 +29,17 @@ fi
 echo "Firing parallel connectivity tests... (Max wait time: ~${TIMEOUT}s)" >&2
 
 # 3. Execution Loop (Multi-Threaded)
+LAST_COMMENT="General"
+
 while IFS= read -r line || [ -n "$line" ]; do
-    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    # Capture the remark/comment
+    if [[ "$line" =~ ^# ]]; then
+        LAST_COMMENT=$(echo "$line" | sed 's/^#//' | xargs)
+        continue
+    fi
+
+    # Skip empty lines
+    [[ -z "$line" ]] && continue
     
     host_part=$(echo "$line" | cut -d':' -f1 | xargs)
     port_part=$(echo "$line" | cut -d':' -f2)
@@ -39,10 +48,9 @@ while IFS= read -r line || [ -n "$line" ]; do
     for port in "${ADDR[@]}"; do
         port=$(echo "$port" | xargs)
         
-        # START BACKGROUND JOB
         (
+            current_remark="$LAST_COMMENT"
             current_date=$(date "+%Y-%m-%d %H:%M:%S")
-            printf "  -> Spawning test for %s on port %s...\n" "$host_part" "$port" >&2
             
             resolved_ip=$(timeout 2s getent hosts "$host_part" | awk '{print $1}' | head -n 1)
             
@@ -64,36 +72,29 @@ while IFS= read -r line || [ -n "$line" ]; do
                     issue="Success"
                 elif [ $exit_code -eq 124 ]; then
                     status="NOK"
-                    issue="Connection Timeout (Firewall Drop)"
+                    issue="Connection Timeout"
                 else
                     status="NOK"
-                    if [[ "$output" == *"refused"* ]]; then
-                        issue="Connection Refused (Service Down)"
-                    else
-                        issue="Network Unreachable"
-                    fi
+                    issue="Refused/Unreachable"
                 fi
             fi
 
-            # If NOK, write raw host:port to the NOK temp file
             if [[ "$status" == "NOK" ]]; then
                 echo "$host_part:$port" >> "$NOK_TEMP"
             fi
 
-            # Write formatted output to the Results temp file
-            printf "%s | %-15s | %-60s | %-8s | %-6s | %-19s | %-25s\n" "$status" "$SOURCE_IP" "$display_dest" "$port" "$status" "$current_date" "$issue" >> "$TEMP_RESULTS"
+            # STORAGE FORMAT: Remark | Source | Destination | Remark (Display) | Port | Status | Date | Issue
+            # We put Remark first so the 'sort' command groups by it.
+            printf "%s | %-15s | %-40s | %-25s | %-8s | %-6s | %-19s | %-25s\n" \
+                "$current_remark" "$SOURCE_IP" "$display_dest" "$current_remark" "$port" "$status" "$current_date" "$issue" >> "$TEMP_RESULTS"
         ) & 
-        # END BACKGROUND JOB
     done
 done < "$INPUT_FILE"
 
-# Wait for all parallel tasks to finish
 wait
 
-# 4. Generate NOK List File (Overwrites previous file)
-# This uses awk to group 'host:p1', 'host:p2' back into 'host:p1,p2'
-echo "# Failed Connections from $INPUT_FILE (Auto-Generated)" > "$OUTPUT_NOK_FILE"
-
+# 4. Generate NOK List File
+echo "# Failed Connections from $INPUT_FILE" > "$OUTPUT_NOK_FILE"
 if [[ -s "$NOK_TEMP" ]]; then
     awk -F':' '{
         if ($1 in ports) { ports[$1] = ports[$1] "," $2 } 
@@ -101,28 +102,27 @@ if [[ -s "$NOK_TEMP" ]]; then
     } END {
         for (host in ports) { print host ":" ports[host] }
     }' "$NOK_TEMP" >> "$OUTPUT_NOK_FILE"
-else
-    echo "# All connections passed! No NOKs found." >> "$OUTPUT_NOK_FILE"
 fi
 
 # 5. Final Output Generation
-echo -e "\nAll tests complete. Generating report...\n" >&2
+echo -e "\nAll tests complete. Grouped by Remark:\n" >&2
 
-printf "%-15s | %-60s | %-8s | %-6s | %-19s | %-25s\n" "SOURCE IP" "DESTINATION (RESOLVED IP)" "PORT" "STATUS" "DATE" "REMARK/ISSUE"
-printf "%0.s-" {1..150}
+printf "%-15s | %-40s | %-25s | %-8s | %-6s | %-19s | %-25s\n" \
+    "SOURCE IP" "DESTINATION (RESOLVED IP)" "GROUP/REMARK" "PORT" "STATUS" "DATE" "REMARK/ISSUE"
+printf "%0.s-" {1..175}
 echo
 
-# Print Sorted Results
+# Print Sorted Results (Sorts by the hidden first column: Remark)
+# Then we use cut to hide that first sorting column from the user output.
 sort "$TEMP_RESULTS" | cut -d'|' -f2-
 
-# 6. Dynamic Summary Calculation
+# 6. Summary
 TOTAL_TESTS=$(wc -l < "$TEMP_RESULTS")
-NOK_COUNT=$(grep -c "^NOK" "$TEMP_RESULTS" || true)
+NOK_COUNT=$(grep -c "| NOK |" "$TEMP_RESULTS" || true)
 OK_COUNT=$((TOTAL_TESTS - NOK_COUNT))
 
 echo "------------------------------------------------------------------------------------------------------------------------------------------------------"
 printf "SUMMARY: %d out of %d connections are NOK (%d OK)\n" "$NOK_COUNT" "$TOTAL_TESTS" "$OK_COUNT"
-echo "-> A list of all failed targets has been written to: $OUTPUT_NOK_FILE"
 echo "------------------------------------------------------------------------------------------------------------------------------------------------------"
 
 # Cleanup
